@@ -1,26 +1,32 @@
 import numpy as np
 import tensorflow as tf
+from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras import layers, models
 import os
 import json
+#from tensorflow.keras.mixed_precision import experimental as mixed_precision
 import cv2
+import pickle
 from tensorflow.python.ops.ragged import ragged_tensor
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import sys
-inputimage = input("Enter image you want to create: ")
+#policy = mixed_precision.Policy('mixed_float16')
+#mixed_precision.set_policy(policy)
+#inputimage = input("Enter image you want to create: ")
+inputimage = "Two bottles of red wine on a table with a glass of wine."
 print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
 if tf.test.gpu_device_name():
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
 else:
     print("Please install GPU version of TF")
 sys.stderr = open("error_output.txt", "w")
-datasize = 10000
-batch_size = 3
-epochs = 20
+datasize = 1000000
+batch_size = 64
+epochs = 1000
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 IMG_SIZE = 640
-num_batches = 4  # Set the number of batches to process
+num_batches = 10  # Set the number of batches to process
 image_folder = 'train2017/train2017/'
 def is_utf8_encodable(s):
     try:
@@ -34,6 +40,22 @@ image_paths = image_paths[:datasize]
 captions_dict = {}
 
 print("Start")
+
+def wasserstein_loss(y_true, y_pred):
+    return tf.reduce_mean(y_true * y_pred)
+
+def gradient_penalty(real_images, fake_images, discriminator):
+    alpha = tf.random.normal([real_images.shape[0], 1, 1, 1], 0.0, 1.0)
+    interpolated_images = alpha * real_images + (1 - alpha) * fake_images
+    with tf.GradientTape() as tape:
+        tape.watch(interpolated_images)
+        predictions = discriminator(interpolated_images)
+    gradients = tape.gradient(predictions, interpolated_images)
+    gradients_sqr = tf.square(gradients)
+    gradients_sqr_sum = tf.reduce_sum(gradients_sqr, axis=[1, 2, 3])
+    gradient_penalty = tf.reduce_mean(gradients_sqr_sum - 1) * 10
+    return gradient_penalty
+
 def load_captions_json(json_path):
     with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
         captions_data = json.load(f)
@@ -52,6 +74,22 @@ def load_captions_json(json_path):
     return captions_dict
 
 captions_json_path = 'train2017/annotations_trainval2017/annotations/captions_train2017.json'
+def generate_image(description, generator, tokenizer, output_dir):
+    # Use the loaded generator and tokenizer here
+    # Load the generator model
+    loaded_generator = tf.keras.models.load_model('generator_model')
+
+    # Load the tokenizer
+    with open('tokenizer.pkl', 'rb') as f:
+        loaded_tokenizer = pickle.load(f)
+
+    # Create an output directory for the generated images
+    output_dir = 'generated_images'
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Use the loaded generator and tokenizer to generate images for different input descriptions
+    generated_image = generate_image(inputimage, loaded_generator, loaded_tokenizer, output_dir)
+    return generated_image
 
 def create_lookup_table(captions_dict):
     keys = list(captions_dict.keys())
@@ -70,6 +108,7 @@ def load_image(image_path):
     img = tf.io.read_file(image_path)
     img = tf.image.decode_jpeg(img, channels=3)
     img = tf.image.resize(img, (IMG_SIZE, IMG_SIZE))
+    img = (img - 127.5) / 127.5  # Normalize the images to [-1, 1]
     return img
 
 
@@ -160,29 +199,70 @@ def test_description(description, generator, tokenizer, output_dir):
     bgr_image = cv2.cvtColor(generated_image_numpy, cv2.COLOR_RGB2BGR)
     cv2.imwrite(image_filename, bgr_image)
 
-    plt.imshow(generated_image_numpy / 255.0)
-    plt.show()
+    #plt.imshow(generated_image_numpy / 255.0)
+    #plt.show()
 
     return generated_image
 
+
+#...
+
+# Changes made in the build_generator function
 def build_generator():
-    model = models.Sequential([
-        layers.Dense(20 * 20 * 1024, activation='relu', input_shape=(200,)),
-        layers.Reshape((20, 20, 1024)),
-        layers.UpSampling2D(),
-        layers.Conv2D(512, (3, 3), padding='same', activation='relu'),
-        layers.UpSampling2D(),
-        layers.Conv2D(256, (3, 3), padding='same', activation='relu'),
-        layers.UpSampling2D(),
-        layers.Conv2D(128, (3, 3), padding='same', activation='relu'),
-        layers.UpSampling2D(),
-        layers.Conv2D(64, (3, 3), padding='same', activation='relu'),
-        layers.UpSampling2D(),  # Add this layer to increase the spatial dimensions
-        layers.Conv2D(3, (3, 3), padding='same', activation='tanh')
-    ])
+    input_layer = layers.Input(shape=(200,))
+    dense1 = layers.Dense(20 * 20 * 1024, activation='relu')(input_layer)
+    reshape1 = layers.Reshape((20, 20, 1024))(dense1)
+    c1 = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(reshape1)
+    p1 = layers.MaxPooling2D((2, 2), padding='same')(c1)
+    c2 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(p1)
+    p2 = layers.MaxPooling2D((2, 2), padding='same')(c2)
+    c3 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(p2)
+    p3 = layers.MaxPooling2D((2, 2), padding='same')(c3)
+
+    u1 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(p3)
+    c3_resized = layers.Lambda(lambda x: tf.image.resize(x, (u1.shape[1], u1.shape[2])))(c3)
+    u1 = layers.concatenate([u1, c3_resized])
+
+    u2 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(u1)
+    c2_resized = layers.Lambda(lambda x: tf.image.resize(x, (u2.shape[1], u2.shape[2])))(c2)
+    u2 = layers.concatenate([u2, c2_resized])
+
+    u3 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(u2)
+    c1_resized = layers.Lambda(lambda x: tf.image.resize(x, (u3.shape[1], u3.shape[2])))(c1)
+    u3 = layers.concatenate([u3, c1_resized])
+
+    # Add more upsampling layers
+    u4 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(u3)
+    u5 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(u4)
+    u6 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(u5)
+    u7 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(u6)
+
+    output_layer = layers.Conv2D(3, (3, 3), padding='same', activation='tanh')(u7)  # Add 'tanh' activation
+
+
+    # Resize the output image to 640x640
+    resized_output = layers.experimental.preprocessing.Resizing(640, 640)(output_layer)
+
+    model = models.Model(inputs=input_layer, outputs=resized_output)
     return model
 
 
+#...
+
+
+def wasserstein_loss(y_true, y_pred):
+    return tf.reduce_mean(y_true * y_pred)
+def gradient_penalty(real_images, fake_images, discriminator):
+    alpha = tf.random.normal([real_images.shape[0], 1, 1, 1], 0.0, 1.0)
+    interpolated_images = alpha * real_images + (1 - alpha) * fake_images
+    with tf.GradientTape() as tape:
+        tape.watch(interpolated_images)
+        predictions = discriminator(interpolated_images)
+    gradients = tape.gradient(predictions, interpolated_images)
+    gradients_sqr = tf.square(gradients)
+    gradients_sqr_sum = tf.reduce_sum(gradients_sqr, axis=[1, 2, 3])
+    gradient_penalty = tf.reduce_mean(gradients_sqr_sum - 1) * 10
+    return gradient_penalty
 
 
 generator = build_generator()
@@ -192,7 +272,9 @@ discriminator = None
 
 # Define loss function and optimizer
 loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-generator_optimizer = tf.keras.optimizers.Adam(1e-4)
+generator_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+
 def generator_loss(fake_output):
     return loss_fn(tf.ones_like(fake_output), fake_output)
 
@@ -201,6 +283,8 @@ def discriminator_loss(real_output, fake_output):
     fake_loss = loss_fn(tf.zeros_like(fake_output), fake_output)
     total_loss = real_loss + fake_loss
     return total_loss
+generator_loss = wasserstein_loss
+discriminator_loss = wasserstein_loss
 def build_discriminator():
     model = models.Sequential([
         layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=(IMG_SIZE, IMG_SIZE, 3)),
@@ -222,8 +306,8 @@ discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
 
 @tf.function
 def train_step(images, captions):
-    noise = tf.random.normal([images.shape[0], 100])  # Changed from 'batch_size' to 'images.shape[0]'
-    captions = tf.cast(captions, tf.float32)  # Add this line to cast captions to float32
+    noise = tf.random.normal([images.shape[0], 100])
+    captions = tf.cast(captions, tf.float32)
     generator_input = tf.concat([noise, captions], axis=-1)
 
     with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
@@ -232,14 +316,22 @@ def train_step(images, captions):
         real_output = discriminator(images, training=True)
         fake_output = discriminator(generated_images, training=True)
 
-        gen_loss = generator_loss(fake_output)
-        disc_loss = discriminator_loss(real_output, fake_output)
+        # Wasserstein loss
+        gen_loss = -tf.reduce_mean(fake_output)
+        disc_loss = tf.reduce_mean(fake_output) - tf.reduce_mean(real_output)
+
+        # Add gradient penalty
+        gp = gradient_penalty(images, generated_images, discriminator)
+        disc_loss += gp
 
     gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
     gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
-    print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")  # Remove .numpy() calls
+    print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")
+
     generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
     discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+
+
 
 
 
@@ -247,7 +339,7 @@ def train_step(images, captions):
 # Training loop
 for epoch in range(epochs):
     print(f'Epoch {epoch + 1}/{epochs}')
-    for step, (images, captions) in enumerate(ds):
+    for step, (images, captions) in enumerate(ds.take(num_batches)):
         encoded_captions = tokenizer.texts_to_sequences([caption.numpy().decode('utf-8') for caption in captions])
         max_length = 100
         padded_captions = tf.keras.preprocessing.sequence.pad_sequences(
@@ -259,10 +351,13 @@ for epoch in range(epochs):
     #Tests generator on each epoch
     output_dir = f'generated_images/epoch_{epoch + 1}'
     os.makedirs(output_dir, exist_ok=True)
-    #print(f"Output directory: {os.path.abspath(output_dir)}")
+    print(f"Output directory: {os.path.abspath(output_dir)}")
     test_description(inputimage, generator, tokenizer, output_dir)
 
+generator.save('generator_model')
 
+with open('tokenizer.pk1', 'wb') as f:
+    pickle.dump(tokenizer,f)
 
 
 #Test generator with example (Merge Descriptions to single text at top)
