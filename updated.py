@@ -23,7 +23,7 @@ else:
     print("Please install GPU version of TF")
 sys.stderr = open("error_output.txt", "w")
 datasize = 100000
-batch_size = 4
+batch_size = 60
 epochs = 1000
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 IMG_SIZE = 299
