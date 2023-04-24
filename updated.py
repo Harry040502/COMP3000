@@ -156,12 +156,10 @@ def test_description(description, generator, tokenizer, output_dir):
 
     #apply padding to sequence/description
     max_length = 100
-    padded_description = tf.keras.preprocessing.sequence.pad_sequences(
-        encoded_description, maxlen=max_length, padding='post')
-    padded_description = tf.pad(encoded_description, [[0, 4 - tf.shape(encoded_description)[0]], [0, 0]])
+    padded_description = tf.keras.preprocessing.sequence.pad_sequences(encoded_description, maxlen=100, padding='post')
 
     #apply noise
-    noise = tf.random.normal([batch_size, 100])
+    noise = tf.random.normal([1, 100])
     generator_input = tf.concat([noise, tf.cast(padded_description, tf.float32)], axis=-1)
     #run generator
     generated_image = generator(generator_input, training=False)
