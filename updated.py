@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
+from tensorflow.keras.preprocessing.text import Tokenizer
+
 import os
 import json
 #from tensorflow.keras.mixed_precision import experimental as mixed_precision
@@ -24,9 +26,10 @@ datasize = 100000
 batch_size = 4
 epochs = 1000
 AUTOTUNE = tf.data.experimental.AUTOTUNE
-IMG_SIZE = 640
-num_batches = 10  # Set the number of batches to process
+IMG_SIZE = 299
+num_batches = 10
 image_folder = 'train2017/train2017/'
+
 def is_utf8_encodable(s):
     try:
         s.encode("utf-8")
@@ -37,7 +40,6 @@ def is_utf8_encodable(s):
 image_paths = [os.path.join(image_folder, img) for img in os.listdir(image_folder) if is_utf8_encodable(img)]
 image_paths = image_paths[:datasize]
 captions_dict = {}
-
 print("Start")
 def load_captions_json(json_path):
     with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -57,23 +59,9 @@ def load_captions_json(json_path):
     return captions_dict
 
 captions_json_path = 'train2017/annotations_trainval2017/annotations/captions_train2017.json'
-def generate_image(description, generator, tokenizer, output_dir):
-    # Use the loaded generator and tokenizer here
-    # Load the generator model
-    loaded_generator = tf.keras.models.load_model('generator_model')
-
-    # Load the tokenizer
-    with open('tokenizer.pkl', 'rb') as f:
-        loaded_tokenizer = pickle.load(f)
-
-    # Create an output directory for the generated images
-    output_dir = 'generated_images'
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Use the loaded generator and tokenizer to generate images for different input descriptions
-    generated_image = generate_image(inputimage, loaded_generator, loaded_tokenizer, output_dir)
-    return generated_image
-
+captions_list = []
+for captions in captions_dict.values():
+    captions_list.extend(captions)
 def create_lookup_table(captions_dict):
     keys = list(captions_dict.keys())
     values = list(captions_dict.values())
@@ -100,42 +88,57 @@ def resize_and_normalize(image):
     image = tf.keras.applications.inception_v3.preprocess_input(image)
     return image
 
-def wrapper_function(image_path_tensor):
-    def wrapped_load_data(image_path_tensor):
-        image_path = image_path_tensor.numpy().decode('utf-8')
-        image = load_image(image_path)
-        caption = captions_lookup_table.lookup(image_path_tensor)
-        return image, caption
 
-    image, caption = tf.py_function(
-        wrapped_load_data,
-        inp=[image_path_tensor],
-        Tout=[tf.float32, tf.string]
-    )
+def wrapper_function(img_path, cap):
+    img_tensor = load_image(img_path)
+    img_tensor = tf.image.resize(img_tensor, (299, 299))
+    img_tensor = tf.keras.applications.inception_v3.preprocess_input(img_tensor)
 
-    image.set_shape((IMG_SIZE, IMG_SIZE, 3))
-    return image, caption
+    cap = tf.strings.as_string(cap) # convert to string type
+    cap = captions_lookup_table.lookup(cap)
+
+    return img_tensor, cap
 
 
-def create_dataset(image_paths):
-    # Load image paths
+
+new_captions_dict = {key: "<end>".join(value.split("<end>")[:3]) for key, value in captions_dict.items()}
+print(new_captions_dict)
+vocab_size = 10000  # Choose an appropriate vocab size based on your dataset
+tokenizer = Tokenizer(num_words=vocab_size, oov_token='<OOV>', filters='!"#$%&()*+.,-/:;=?@[\]^_`{|}~ ')
+tokenizer.fit_on_texts(captions_list)
+def create_dataset(image_paths, captions_dict, batch_size):
+    # Tokenize and pad captions
+    captions_list = list(captions_dict.values())
+    encoded_captions = tokenizer.texts_to_sequences(captions_list)
+    max_length = 100
+    padded_captions = tf.keras.preprocessing.sequence.pad_sequences(encoded_captions, maxlen=max_length, padding='post')
+
+    # Create the dataset
     image_paths = tf.data.Dataset.from_tensor_slices(image_paths)
-
-    # Load images and captions
-    ds = image_paths.map(wrapper_function, num_parallel_calls=AUTOTUNE)
-
+    captions_tensor = tf.constant(padded_captions, dtype=tf.int32)
+    captions = tf.data.Dataset.from_tensor_slices(captions_tensor)
+    ds = tf.data.Dataset.zip((image_paths, captions))
+    ds = ds.map(wrapper_function, num_parallel_calls=AUTOTUNE)
+    ds = ds.batch(batch_size)  # Add this line to create batches
     return ds
 
-ds = create_dataset(image_paths)
+
+
+
+
+ds = create_dataset(image_paths, captions_dict, batch_size)
+
+
 for image, label in ds.take(1):
     print("Image:", image)
     print("Label:", label)
     print("Image shape:", image.shape)
-# Fit the tokenizer on the dataset
+#attempt to fit tokenizer (Review Tokenizer doesnt appear to work as intended)
 tokenizer = tf.keras.preprocessing.text.Tokenizer()
 
 captions_list = []
 iter = 0
+
 def resize_images(image, label):
     print(f"Image shape before resizing: {image.shape}")
     resized_image = tf.image.resize(image, (IMG_SIZE, IMG_SIZE))
@@ -143,39 +146,30 @@ def resize_images(image, label):
 
 
 
-ds = ds.map(resize_images)
-ds = ds.batch(batch_size)
-for images, captions in ds.take(num_batches):
-    captions = [caption.numpy().decode('utf-8') for caption in captions]
+captions_list = list(captions_dict.values())
+tokenizer.fit_on_texts(captions_list)
 
-    tokenizer.fit_on_texts(captions)
-
-    iter += 1
-    if iter >= datasize:
-        break
-
-print("reachmepls")
 
 def test_description(description, generator, tokenizer, output_dir):
-    # Convert the description into a sequence of integers
+    #description to images for use by Generator
     encoded_description = tokenizer.texts_to_sequences([description])
 
-    # Pad the sequence to the maximum length
+    #apply padding to sequence/description
     max_length = 100
     padded_description = tf.keras.preprocessing.sequence.pad_sequences(
         encoded_description, maxlen=max_length, padding='post')
+    padded_description = tf.pad(encoded_description, [[0, 4 - tf.shape(encoded_description)[0]], [0, 0]])
 
-    # Concatenate the random noise vector with the padded sequence
-    noise = tf.random.normal([1, 100])
-    generator_input = tf.concat([noise, padded_description], axis=-1)
-
-    # Generate an image from the description
+    #apply noise
+    noise = tf.random.normal([batch_size, 100])
+    generator_input = tf.concat([noise, tf.cast(padded_description, tf.float32)], axis=-1)
+    #run generator
     generated_image = generator(generator_input, training=False)
 
-    # Convert the image from [-1, 1] to [0, 1] range
+    #change lighting of generated_image
     generated_image = (generated_image + 1) / 2.0
 
-    # Save the generated image to the output directory
+    #save image to output directly with description_name
     image_filename = os.path.join(output_dir, f'{description}.jpg')
     generated_image_numpy = np.float32(generated_image.numpy()[0] * 255)
     bgr_image = cv2.cvtColor(generated_image_numpy, cv2.COLOR_RGB2BGR)
@@ -187,10 +181,7 @@ def test_description(description, generator, tokenizer, output_dir):
     return generated_image
 
 
-#...
-
-# Changes made in the build_generator function
-def build_generator():
+def build_generator(): #builds image generator
     input_layer = layers.Input(shape=(200,))
     dense1 = layers.Dense(20 * 20 * 1024, activation='relu')(input_layer)
     reshape1 = layers.Reshape((20, 20, 1024))(dense1)
@@ -213,7 +204,7 @@ def build_generator():
     c1_resized = layers.Lambda(lambda x: tf.image.resize(x, (u3.shape[1], u3.shape[2])))(c1)
     u3 = layers.concatenate([u3, c1_resized])
 
-    # Add more upsampling layers
+    #More Upsampling Layers added after the fact
     u4 = layers.Conv2DTranspose(512, (2, 2), strides=(2, 2), padding='same')(u3)
     u5 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(u4)
     u6 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(u5)
@@ -222,18 +213,12 @@ def build_generator():
     output_layer = layers.Conv2D(3, (3, 3), padding='same')(u7)
 
 
-    # Resize the output image to 640x640
-    resized_output = layers.experimental.preprocessing.Resizing(640, 640)(output_layer)
+    #resize to IMG_SIZE
+    resized_output = layers.experimental.preprocessing.Resizing(IMG_SIZE, IMG_SIZE)(output_layer)
 
     model = models.Model(inputs=input_layer, outputs=resized_output)
     return model
 
-
-#...
-
-
-def wasserstein_loss(y_true, y_pred):
-    return tf.reduce_mean(y_true * y_pred)
 def gradient_penalty(real_images, fake_images, discriminator):
     alpha = tf.random.normal([real_images.shape[0], 1, 1, 1], 0.0, 1.0)
     interpolated_images = alpha * real_images + (1 - alpha) * fake_images
@@ -249,25 +234,16 @@ def gradient_penalty(real_images, fake_images, discriminator):
 
 generator = build_generator()
 
-# Dummy discriminator, as we're not using it in this example
+#init discriminator
 discriminator = None
-
-# Define loss function and optimizer
 loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-generator_optimizer = tf.keras.optimizers.RMSprop(1e-3)
-discriminator_optimizer = tf.keras.optimizers.RMSprop(1e-3)
-def generator_loss(fake_output):
-    return loss_fn(tf.ones_like(fake_output), fake_output)
+generator_optimizer = tf.keras.optimizers.RMSprop(1e-3) #using rmsprop optimizer (might change to Adam depending on performance when results start coming through)
+discriminator_optimizer = tf.keras.optimizers.RMSprop(1e-3) #Same as above had mixed results using RMS and Adam
 
-def discriminator_loss(real_output, fake_output):
-    real_loss = loss_fn(tf.ones_like(real_output), real_output)
-    fake_loss = loss_fn(tf.zeros_like(fake_output), fake_output)
-    total_loss = real_loss + fake_loss
-    return total_loss
 def build_discriminator():
     model = models.Sequential([
         layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=(IMG_SIZE, IMG_SIZE, 3)),
-        layers.LeakyReLU(),
+        layers.LeakyReLU(), #set to leaky to avoid linear relationships
         layers.Dropout(0.3),
 
         layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same'),
@@ -285,40 +261,41 @@ discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
 
 @tf.function
 def train_step(images, captions):
-    noise = tf.random.normal([images.shape[0], 100])
-    captions = tf.cast(captions, tf.float32)
-    generator_input = tf.concat([noise, captions], axis=-1)
+    for i in range(images.shape[0]):
+        noise = tf.random.normal([1, 100])
+        caption = tf.expand_dims(captions[i], axis=0)
+        caption = tf.cast(caption, tf.float32)
+        generator_input = tf.concat([noise, caption], axis=-1)
 
-    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
-        generated_images = generator(generator_input, training=True)
+        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+            generated_image = generator(generator_input, training=True)
 
-        real_output = discriminator(images, training=True)
-        fake_output = discriminator(generated_images, training=True)
+            real_output = discriminator(images[i:i+1], training=True)
+            fake_output = discriminator(generated_image, training=True)
 
-        # Wasserstein loss
-        gen_loss = -tf.reduce_mean(fake_output)
-        disc_loss = tf.reduce_mean(fake_output) - tf.reduce_mean(real_output)
+            #add a wasserstein loss function
+            gen_loss = -tf.reduce_mean(fake_output)
+            disc_loss = tf.reduce_mean(fake_output) - tf.reduce_mean(real_output)
 
-        # Add gradient penalty
-        gp = gradient_penalty(images, generated_images, discriminator)
-        disc_loss += gp
+            #add a gradient penalty
+            gp = gradient_penalty(images[i:i+1], generated_image, discriminator)
+            disc_loss += gp
 
-    gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
-    gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
-    print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")
+        gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
+        gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+        print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")
 
-    generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
-    discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
-
-
+        generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
+        discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
 
 
-
-# Training loop
+#Start the Training Loop
 for epoch in range(epochs):
     print(f'Epoch {epoch + 1}/{epochs}')
-    for step, (images, captions) in enumerate(ds.take(num_batches)):
-        encoded_captions = tokenizer.texts_to_sequences([caption.numpy().decode('utf-8') for caption in captions])
+    print("Batch Size: " + str(batch_size))
+    for step, (images, captions) in enumerate(ds.take(batch_size).unbatch().batch(batch_size)):
+        captions_list = [caption.astype('U').tolist() for caption in captions.numpy()]
+        encoded_captions = tokenizer.texts_to_sequences(captions_list)
         max_length = 100
         padded_captions = tf.keras.preprocessing.sequence.pad_sequences(
             encoded_captions, maxlen=max_length, padding='post')
@@ -326,7 +303,9 @@ for epoch in range(epochs):
         print('.', end='')
     print()
 
+
     #Tests generator on each epoch
+    #create all images in individual epoch folders starting from 1
     output_dir = f'generated_images/epoch_{epoch + 1}'
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {os.path.abspath(output_dir)}")
@@ -336,9 +315,3 @@ generator.save('generator_model')
 
 with open('tokenizer.pk1', 'wb') as f:
     pickle.dump(tokenizer,f)
-
-
-#Test generator with example (Merge Descriptions to single text at top)
-output_dir = 'generated_images'
-os.makedirs(output_dir, exist_ok=True)
-test_description(inputimage, generator, tokenizer, output_dir)
