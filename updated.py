@@ -15,7 +15,7 @@ import sys
 #policy = mixed_precision.Policy('mixed_float16')
 #mixed_precision.set_policy(policy)
 #inputimage = input("Enter image you want to create: ")
-inputimage = "Two bottles of red wine on a table with a glass of wine."
+inputimage = "A blue sky"
 print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
 if tf.test.gpu_device_name():
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
@@ -23,6 +23,7 @@ else:
     print("Please install GPU version of TF")
 sys.stderr = open("error_output.txt", "w")
 datasize = 100000
+learning_rate = 1e-4
 batch_size = 60
 epochs = 1000
 AUTOTUNE = tf.data.experimental.AUTOTUNE
@@ -209,20 +210,19 @@ def build_generator(): #builds image generator
     u7 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(u6)
 
     output_layer = layers.Conv2D(3, (3, 3), padding='same')(u7)
-
-
+    output_layer = layers.Conv2D(3, (3, 3), activation='tanh', padding='same')(u7)
     #resize to IMG_SIZE
     resized_output = layers.experimental.preprocessing.Resizing(IMG_SIZE, IMG_SIZE)(output_layer)
 
     model = models.Model(inputs=input_layer, outputs=resized_output)
     return model
 
-def gradient_penalty(real_images, fake_images, discriminator):
+def gradient_penalty(real_images, fake_images, discriminator, caption):
     alpha = tf.random.normal([real_images.shape[0], 1, 1, 1], 0.0, 1.0)
     interpolated_images = alpha * real_images + (1 - alpha) * fake_images
     with tf.GradientTape() as tape:
         tape.watch(interpolated_images)
-        predictions = discriminator(interpolated_images)
+        predictions = discriminator([interpolated_images, caption])
     gradients = tape.gradient(predictions, interpolated_images)
     gradients_sqr = tf.square(gradients)
     gradients_sqr_sum = tf.reduce_sum(gradients_sqr, axis=[1, 2, 3])
@@ -234,31 +234,48 @@ generator = build_generator()
 
 #init discriminator
 discriminator = None
+lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=learning_rate, decay_steps=10000, alpha=0.1
+)
 loss_fn = tf.keras.losses.BinaryCrossentropy(from_logits=True)
-generator_optimizer = tf.keras.optimizers.RMSprop(1e-3) #using rmsprop optimizer (might change to Adam depending on performance when results start coming through)
-discriminator_optimizer = tf.keras.optimizers.RMSprop(1e-3) #Same as above had mixed results using RMS and Adam
+generator_optimizer = tf.keras.optimizers.RMSprop(learning_rate) #using rmsprop optimizer (might change to Adam depending on performance when results start coming through)
 
 def build_discriminator():
-    model = models.Sequential([
-        layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same', input_shape=(IMG_SIZE, IMG_SIZE, 3)),
-        layers.LeakyReLU(), #set to leaky to avoid linear relationships
-        layers.Dropout(0.3),
+    input_image = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
+    input_caption = layers.Input(shape=(100,))
 
-        layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same'),
-        layers.LeakyReLU(),
-        layers.Dropout(0.3),
+    # Use an embedding layer to process captions
+    x = layers.Embedding(vocab_size, 128)(input_caption)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(IMG_SIZE * IMG_SIZE)(x)
+    x = layers.Reshape((IMG_SIZE, IMG_SIZE, 1))(x)
 
-        layers.Flatten(),
-        layers.Dense(1)
-    ])
+    # Combine image and caption
+    x = layers.Concatenate(axis=-1)([input_image, x])
+
+    x = layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same')(x)
+    x = layers.LeakyReLU()(x)  # Fixed this line
+    x = layers.Dropout(0.3)(x)
+
+    x = layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same')(x)
+    x = layers.LeakyReLU()(x)  # Fixed this line
+    x = layers.Dropout(0.3)(x)
+
+    x = layers.Flatten()(x)
+    output = layers.Dense(1)(x)
+
+    model = models.Model(inputs=[input_image, input_caption], outputs=output)
     return model
 
 
+
+
 discriminator = build_discriminator()
-discriminator_optimizer = tf.keras.optimizers.Adam(1e-4)
+discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate)
 
 @tf.function
 def train_step(images, captions):
+
     for i in range(images.shape[0]):
         noise = tf.random.normal([1, 100])
         caption = tf.expand_dims(captions[i], axis=0)
@@ -268,15 +285,15 @@ def train_step(images, captions):
         with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
             generated_image = generator(generator_input, training=True)
 
-            real_output = discriminator(images[i:i+1], training=True)
-            fake_output = discriminator(generated_image, training=True)
+            real_output = discriminator([images[i:i + 1], captions[i:i + 1]], training=True)
+            fake_output = discriminator([generated_image, captions[i:i + 1]], training=True)
 
             #add a wasserstein loss function
             gen_loss = -tf.reduce_mean(fake_output)
             disc_loss = tf.reduce_mean(fake_output) - tf.reduce_mean(real_output)
 
             #add a gradient penalty
-            gp = gradient_penalty(images[i:i+1], generated_image, discriminator)
+            gp = gradient_penalty(images[i:i+1], generated_image, discriminator, captions[i:i+1])
             disc_loss += gp
 
         gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
