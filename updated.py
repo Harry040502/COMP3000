@@ -2,6 +2,10 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.applications.inception_v3 import preprocess_input
+from scipy.linalg import sqrtm
+from tensorflow.keras.applications.inception_v3 import InceptionV3
+
 
 import os
 import json
@@ -12,6 +16,7 @@ from tensorflow.python.ops.ragged import ragged_tensor
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import sys
+
 #policy = mixed_precision.Policy('mixed_float16')
 #mixed_precision.set_policy(policy)
 #inputimage = input("Enter image you want to create: ")
@@ -24,12 +29,11 @@ else:
 sys.stderr = open("error_output.txt", "w")
 datasize = 100000
 learning_rate = 1e-4
-batch_size = 60
-epochs = 1000
+batch_size = 20
+epochs = 10
 AUTOTUNE = tf.data.experimental.AUTOTUNE
-IMG_SIZE = 299
-num_batches = 10
-image_folder = 'train2017/train2017/'
+IMG_SIZE = 640
+image_folder = 'filtered_images'
 
 def is_utf8_encodable(s):
     try:
@@ -42,24 +46,71 @@ image_paths = [os.path.join(image_folder, img) for img in os.listdir(image_folde
 image_paths = image_paths[:datasize]
 captions_dict = {}
 print("Start")
+# Load the InceptionV3 model without the top layers
+inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
+
+def calculate_fid(model, images1, images2): #used for calculating accuracy of cGAN
+    # Calculate activations
+    act1 = model.predict(images1)
+    act2 = model.predict(images2)
+
+    # Calculate mean and covariance statistics
+    mu1, sigma1 = act1.mean(axis=0), np.cov(act1, rowvar=False)
+    mu2, sigma2 = act2.mean(axis=0), np.cov(act2, rowvar=False)
+
+    # Calculate the sum of squared differences between the means
+    ssdiff = np.sum((mu1 - mu2)**2.0)
+
+    # Calculate sqrt of the product of covariance matrices
+    covmean = sqrtm(sigma1.dot(sigma2))
+
+    # Check for product being a complex number due to numerical precision issues
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    # Calculate the FID score
+    fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
+    return fid
+def evaluate_generator(generator, inception_model, image_paths, tokenizer, num_samples=1000):
+    real_images = []
+    generated_images = []
+
+    for i in range(num_samples):
+        # Load and preprocess real image
+        real_image = load_image(image_paths[i])
+        real_image = resize_and_normalize(real_image)
+        real_image = np.expand_dims(real_image, axis=0)
+
+        # Generate image based on the caption
+        caption = captions_lookup_table.lookup(tf.constant(i, dtype=tf.int32))
+
+        generated_image = test_description(caption.numpy().decode('utf-8'), generator, tokenizer, 'evaluation_output')
+
+        real_images.append(real_image)
+        generated_images.append(generated_image)
+
+    real_images = np.concatenate(real_images, axis=0)
+    generated_images = np.concatenate(generated_images, axis=0)
+
+    fid_score = calculate_fid(inception_model, real_images, generated_images)
+    return fid_score
+
+
 def load_captions_json(json_path):
-    with open(json_path, 'r', encoding='utf-8', errors='ignore') as f:
-        captions_data = json.load(f)
+    with open(json_path, 'r') as file:
+        data = json.load(file)
 
-    for item in captions_data['annotations']:
-        image_id = str(item['image_id']).zfill(12)
+    captions_dict = {}
+
+    for item in data:  # Iterate over each dictionary in the list
+        image_id = int(item['image_id'])  # Convert the image_id to an integer
         caption = item['caption']
-
-        if image_id not in captions_dict:
-            captions_dict[image_id] = []
-        captions_dict[image_id].append(caption)
-
-    for image_id in captions_dict:
-        captions_dict[image_id] = '<end>'.join(captions_dict[image_id])
+        captions_dict[image_id] = caption
 
     return captions_dict
 
-captions_json_path = 'train2017/annotations_trainval2017/annotations/captions_train2017.json'
+
+captions_json_path = 'filtered_annotations.json'
 captions_list = []
 for captions in captions_dict.values():
     captions_list.extend(captions)
@@ -92,13 +143,16 @@ def resize_and_normalize(image):
 
 def wrapper_function(img_path, cap):
     img_tensor = load_image(img_path)
-    img_tensor = tf.image.resize(img_tensor, (299, 299))
+    img_tensor = tf.image.resize(img_tensor, (IMG_SIZE, IMG_SIZE))
     img_tensor = tf.keras.applications.inception_v3.preprocess_input(img_tensor)
 
-    cap = tf.strings.as_string(cap) # convert to string type
+    # Remove this line
+    # cap = tf.strings.as_string(cap) # convert to string type
     cap = captions_lookup_table.lookup(cap)
 
     return img_tensor, cap
+
+
 
 
 
@@ -244,21 +298,21 @@ def build_discriminator():
     input_image = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     input_caption = layers.Input(shape=(100,))
 
-    # Use an embedding layer to process captions
+    #Use an embedding layer to process captions
     x = layers.Embedding(vocab_size, 128)(input_caption)
     x = layers.GlobalAveragePooling1D()(x)
     x = layers.Dense(IMG_SIZE * IMG_SIZE)(x)
     x = layers.Reshape((IMG_SIZE, IMG_SIZE, 1))(x)
 
-    # Combine image and caption
+    #Combines image and caption
     x = layers.Concatenate(axis=-1)([input_image, x])
 
     x = layers.Conv2D(64, (5, 5), strides=(2, 2), padding='same')(x)
-    x = layers.LeakyReLU()(x)  # Fixed this line
+    x = layers.LeakyReLU()(x)
     x = layers.Dropout(0.3)(x)
 
     x = layers.Conv2D(128, (5, 5), strides=(2, 2), padding='same')(x)
-    x = layers.LeakyReLU()(x)  # Fixed this line
+    x = layers.LeakyReLU()(x)
     x = layers.Dropout(0.3)(x)
 
     x = layers.Flatten()(x)
@@ -266,8 +320,6 @@ def build_discriminator():
 
     model = models.Model(inputs=[input_image, input_caption], outputs=output)
     return model
-
-
 
 
 discriminator = build_discriminator()
@@ -325,7 +377,9 @@ for epoch in range(epochs):
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {os.path.abspath(output_dir)}")
     test_description(inputimage, generator, tokenizer, output_dir)
-
+fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
+print("FID score:", fid_score)
+print("Reached me")
 generator.save('generator_model')
 
 with open('tokenizer.pk1', 'wb') as f:
