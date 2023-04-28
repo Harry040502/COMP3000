@@ -20,7 +20,7 @@ import sys
 #policy = mixed_precision.Policy('mixed_float16')
 #mixed_precision.set_policy(policy)
 #inputimage = input("Enter image you want to create: ")
-inputimage = "A blue sky"
+inputimage = "Flowers"
 print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
 if tf.test.gpu_device_name():
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
@@ -29,8 +29,8 @@ else:
 sys.stderr = open("error_output.txt", "w")
 datasize = 100000
 learning_rate = 1e-4
-batch_size = 20
-epochs = 10
+batch_size = 10
+epochs = 100
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 IMG_SIZE = 640
 image_folder = 'filtered_images'
@@ -47,7 +47,7 @@ image_paths = image_paths[:datasize]
 captions_dict = {}
 print("Start")
 # Load the InceptionV3 model without the top layers
-inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(299, 299, 3))
+inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
 
 def calculate_fid(model, images1, images2): #used for calculating accuracy of cGAN
     # Calculate activations
