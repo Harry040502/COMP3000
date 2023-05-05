@@ -3,6 +3,13 @@ import os
 import shutil
 
 def filter_and_copy_images(keyword, source_images_folder, source_annotations_file, output_images_folder, output_annotations_file):
+    # Delete the output directory if it exists
+    if os.path.exists(output_images_folder):
+        shutil.rmtree(output_images_folder)
+        
+    # Delete the output annotations file if it exists
+    if os.path.exists(output_annotations_file):
+        os.remove(output_annotations_file)
     # Create the output directory if it doesn't exist
     os.makedirs(output_images_folder, exist_ok=True)
 
@@ -13,6 +20,9 @@ def filter_and_copy_images(keyword, source_images_folder, source_annotations_fil
     filtered_data = [item for item in annotations_list if keyword.lower() in item['caption'].lower()]
 
     print(f"Number of images found for keyword '{keyword}': {len(filtered_data)}")
+    if (len(filtered_data) <= 10):
+        print("The input you gave doesn't make sense or exist within the given dataset")
+        raise SystemExit()
 
     # Copy the images to the output directory
     for item in filtered_data:
@@ -27,11 +37,9 @@ def filter_and_copy_images(keyword, source_images_folder, source_annotations_fil
     with open(output_annotations_file, 'w') as f:
         json.dump(filtered_data, f)
 
-keyword = input("Enter a keyword to filter images: ")
 
 source_images_folder = "train2017/train2017/"
 source_annotations_file = "train2017/annotations_trainval2017/annotations/captions_train2017.json"
 output_images_folder = "filtered_images/"
-output_annotations_file = "filtered_annotations.json"
+output_annotations_file = "filtered_captions.json"
 
-filter_and_copy_images(keyword, source_images_folder, source_annotations_file, output_images_folder, output_annotations_file)

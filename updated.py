@@ -6,7 +6,7 @@ from tensorflow.keras.applications.inception_v3 import preprocess_input
 from scipy.linalg import sqrtm
 from tensorflow.keras.applications.inception_v3 import InceptionV3
 
-
+import nvidia_smi
 import os
 import json
 #from tensorflow.keras.mixed_precision import experimental as mixed_precision
@@ -16,24 +16,70 @@ from tensorflow.python.ops.ragged import ragged_tensor
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import sys
-
+from createnewdataset import filter_and_copy_images
 #policy = mixed_precision.Policy('mixed_float16')
+tf.keras.backend.clear_session()
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True) #experimental feature in this case required for consumer GPUs due to high GPU memory consumption by my program.
+    except RuntimeError as e:
+        print(e)
 #mixed_precision.set_policy(policy)
-#inputimage = input("Enter image you want to create: ")
-inputimage = "Flowers"
+inputtextimage = input("Enter the image you would like to generate: ")
+if not inputtextimage:
+    print("The input cannot be empty")
+    raise SystemExit()
+elif inputtextimage.isspace():
+    print("The input cannot be empty")
+    raise SystemExit()
+source_images_folder = "train2017/train2017/"
+source_annotations_file = "train2017/annotations_trainval2017/annotations/captions_train2017.json"
+output_images_folder = "filtered_images/"
+output_annotations_file = "filtered_captions.json"
+filter_and_copy_images(inputtextimage, source_images_folder, source_annotations_file, output_images_folder, output_annotations_file)
 print("Num GPUs Available: ", len(tf.config.experimental.list_physical_devices('GPU')))
+if (len(tf.config.experimental.list_physical_devices('GPU')) > 0):
+    print("I recommend you run this on anaconda with GPU support for faster run times (Note that this may affect max allowed batch size dependant on GPU memory size")
 if tf.test.gpu_device_name():
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
 else:
     print("Please install GPU version of TF")
+
+tf.keras.backend.clear_session() #needed to clear GPU memory from filter_and_copy images using it all up
 sys.stderr = open("error_output.txt", "w")
-datasize = 100000
+datasize = 10000 #May need to reduce this if you have problems with certain inputs and memory problems on GPU
 learning_rate = 1e-4
-batch_size = 10
-epochs = 100
+batch_size = 20
+epochs = 300
 AUTOTUNE = tf.data.experimental.AUTOTUNE
-IMG_SIZE = 640
+IMG_SIZE = 399
 image_folder = 'filtered_images'
+def evaluate_generator(generator, inception_model, image_paths, tokenizer, num_samples=1000):
+    real_images = []
+    generated_images = []
+    num_samples = min(num_samples, len(image_paths))
+
+    for i in range(num_samples):
+        #load and process the real image
+        real_image = load_image(image_paths[i])
+        real_image = resize_and_normalize(real_image)
+        real_image = np.expand_dims(real_image, axis=0)
+
+        #Generate images based on the caption
+        caption = captions_lookup_table.lookup(tf.constant(i, dtype=tf.int32))
+
+        generated_image = test_description(caption.numpy().decode('utf-8'), generator, tokenizer, 'evaluation_output')
+
+        real_images.append(real_image)
+        generated_images.append(generated_image)
+
+    real_images = np.concatenate(real_images, axis=0)
+    generated_images = np.concatenate(generated_images, axis=0)
+    #Note enabling the below line can cause longer train times. as it will generate a score per epoch.
+    fid_score = calculate_fid(inception_model, real_images, generated_images)
+    return fid_score
 
 def is_utf8_encodable(s):
     try:
@@ -46,54 +92,23 @@ image_paths = [os.path.join(image_folder, img) for img in os.listdir(image_folde
 image_paths = image_paths[:datasize]
 captions_dict = {}
 print("Start")
-# Load the InceptionV3 model without the top layers
-inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
+#load inception without top layers
 
 def calculate_fid(model, images1, images2): #used for calculating accuracy of cGAN
-    # Calculate activations
     act1 = model.predict(images1)
     act2 = model.predict(images2)
 
-    # Calculate mean and covariance statistics
     mu1, sigma1 = act1.mean(axis=0), np.cov(act1, rowvar=False)
     mu2, sigma2 = act2.mean(axis=0), np.cov(act2, rowvar=False)
-
-    # Calculate the sum of squared differences between the means
     ssdiff = np.sum((mu1 - mu2)**2.0)
+    covmean = sqrtm(sigma1.dot(sigma2)) #use scipy to use matrix square root for computation optimization
 
-    # Calculate sqrt of the product of covariance matrices
-    covmean = sqrtm(sigma1.dot(sigma2))
-
-    # Check for product being a complex number due to numerical precision issues
     if np.iscomplexobj(covmean):
         covmean = covmean.real
 
-    # Calculate the FID score
+    #Calculate FID Score
     fid = ssdiff + np.trace(sigma1 + sigma2 - 2.0 * covmean)
     return fid
-def evaluate_generator(generator, inception_model, image_paths, tokenizer, num_samples=1000):
-    real_images = []
-    generated_images = []
-
-    for i in range(num_samples):
-        # Load and preprocess real image
-        real_image = load_image(image_paths[i])
-        real_image = resize_and_normalize(real_image)
-        real_image = np.expand_dims(real_image, axis=0)
-
-        # Generate image based on the caption
-        caption = captions_lookup_table.lookup(tf.constant(i, dtype=tf.int32))
-
-        generated_image = test_description(caption.numpy().decode('utf-8'), generator, tokenizer, 'evaluation_output')
-
-        real_images.append(real_image)
-        generated_images.append(generated_image)
-
-    real_images = np.concatenate(real_images, axis=0)
-    generated_images = np.concatenate(generated_images, axis=0)
-
-    fid_score = calculate_fid(inception_model, real_images, generated_images)
-    return fid_score
 
 
 def load_captions_json(json_path):
@@ -102,15 +117,15 @@ def load_captions_json(json_path):
 
     captions_dict = {}
 
-    for item in data:  # Iterate over each dictionary in the list
-        image_id = int(item['image_id'])  # Convert the image_id to an integer
+    for item in data:  #Iterate over each dict in list
+        image_id = int(item['image_id'])  #Convert the image_id to an integer so it can be processed
         caption = item['caption']
         captions_dict[image_id] = caption
 
     return captions_dict
 
 
-captions_json_path = 'filtered_annotations.json'
+captions_json_path = 'filtered_captions.json'
 captions_list = []
 for captions in captions_dict.values():
     captions_list.extend(captions)
@@ -146,8 +161,6 @@ def wrapper_function(img_path, cap):
     img_tensor = tf.image.resize(img_tensor, (IMG_SIZE, IMG_SIZE))
     img_tensor = tf.keras.applications.inception_v3.preprocess_input(img_tensor)
 
-    # Remove this line
-    # cap = tf.strings.as_string(cap) # convert to string type
     cap = captions_lookup_table.lookup(cap)
 
     return img_tensor, cap
@@ -158,23 +171,22 @@ def wrapper_function(img_path, cap):
 
 new_captions_dict = {key: "<end>".join(value.split("<end>")[:3]) for key, value in captions_dict.items()}
 print(new_captions_dict)
-vocab_size = 10000  # Choose an appropriate vocab size based on your dataset
+vocab_size = 10000
 tokenizer = Tokenizer(num_words=vocab_size, oov_token='<OOV>', filters='!"#$%&()*+.,-/:;=?@[\]^_`{|}~ ')
 tokenizer.fit_on_texts(captions_list)
 def create_dataset(image_paths, captions_dict, batch_size):
-    # Tokenize and pad captions
     captions_list = list(captions_dict.values())
     encoded_captions = tokenizer.texts_to_sequences(captions_list)
     max_length = 100
     padded_captions = tf.keras.preprocessing.sequence.pad_sequences(encoded_captions, maxlen=max_length, padding='post')
 
-    # Create the dataset
+    #create dataset
     image_paths = tf.data.Dataset.from_tensor_slices(image_paths)
     captions_tensor = tf.constant(padded_captions, dtype=tf.int32)
     captions = tf.data.Dataset.from_tensor_slices(captions_tensor)
     ds = tf.data.Dataset.zip((image_paths, captions))
     ds = ds.map(wrapper_function, num_parallel_calls=AUTOTUNE)
-    ds = ds.batch(batch_size)  # Add this line to create batches
+    ds = ds.batch(batch_size)
     return ds
 
 
@@ -368,6 +380,17 @@ for epoch in range(epochs):
             encoded_captions, maxlen=max_length, padding='post')
         train_step(images, padded_captions)
         print('.', end='')
+    # May Cause Lots of lag (doesnt work on my GPU due to memory limits)
+    if bool(gpus) == False: #check if gpu is present
+        nvidia_smi.nvmlInit()
+        handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0) #only works for 1 card as 0 is hardcoded
+        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle) #finds GPU card info (specifically free memory is what we are looking for)
+        if (int(info.free) > (12/1.074e+9)): #determines how much free memory you have and whether you're capable of running this program
+            inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
+            fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
+            print(f"FID score for epoch {epoch + 1}: {fid_score}")
+
+
     print()
 
 
@@ -376,11 +399,15 @@ for epoch in range(epochs):
     output_dir = f'generated_images/epoch_{epoch + 1}'
     os.makedirs(output_dir, exist_ok=True)
     print(f"Output directory: {os.path.abspath(output_dir)}")
-    test_description(inputimage, generator, tokenizer, output_dir)
+    test_description(inputtextimage, generator, tokenizer, output_dir)
+try:
+    generator.save('generator_model', save_format='tf') #saves generator as file so it doesnt require retraining.
+except:
+    print("Unable to save generator model.")
+inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
 fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
 print("FID score:", fid_score)
 print("Reached me")
-generator.save('generator_model')
-
 with open('tokenizer.pk1', 'wb') as f:
     pickle.dump(tokenizer,f)
+sys.stdout = open('output.txt', 'wt')
