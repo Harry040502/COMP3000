@@ -1,0 +1,8 @@
+# used to remove folders
+generated_images
+generator_model
+filtered_images
+train2017
+filtered_captions.json
+error_output.txt
+output.txt
