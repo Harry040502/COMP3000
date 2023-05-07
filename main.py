@@ -51,8 +51,8 @@ tf.keras.backend.clear_session() #needed to clear GPU memory from filter_and_cop
 sys.stderr = open("error_output.txt", "w")
 datasize = 10000 #May need to reduce this if you have problems with certain inputs and memory problems on GPU
 learning_rate = 1e-4
-batch_size = 20
-epochs = 300
+batch_size = 40
+epochs = 100
 AUTOTUNE = tf.data.experimental.AUTOTUNE
 IMG_SIZE = 399
 image_folder = 'filtered_images'
@@ -336,8 +336,21 @@ def build_discriminator():
 
 discriminator = build_discriminator()
 discriminator_optimizer = tf.keras.optimizers.Adam(learning_rate)
+def plot_losses(gen_losses, disc_losses):
+    epochs = range(1, len(gen_losses) + 1)
 
-@tf.function
+    plt.figure(figsize=(10, 5))
+
+    plt.plot(epochs, gen_losses, label='Generator Loss', linestyle='-', marker='o')
+    plt.plot(epochs, disc_losses, label='Discriminator Loss', linestyle='-', marker='o')
+
+    plt.title('Generator and Discriminator Losses')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid()
+
+    plt.savefig('losses_plot.png')  # Save the plot to a file
 def train_step(images, captions):
 
     for i in range(images.shape[0]):
@@ -366,25 +379,39 @@ def train_step(images, captions):
 
         generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
         discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
+    return gen_loss, disc_loss
 
-
+gen_losses = []
+disc_losses = []
 #Start the Training Loop
 for epoch in range(epochs):
     print(f'Epoch {epoch + 1}/{epochs}')
     print("Batch Size: " + str(batch_size))
+    gen_loss_epoch = []
+    disc_loss_epoch = []
     for step, (images, captions) in enumerate(ds.take(batch_size).unbatch().batch(batch_size)):
         captions_list = [caption.astype('U').tolist() for caption in captions.numpy()]
         encoded_captions = tokenizer.texts_to_sequences(captions_list)
         max_length = 100
         padded_captions = tf.keras.preprocessing.sequence.pad_sequences(
             encoded_captions, maxlen=max_length, padding='post')
-        train_step(images, padded_captions)
+        gen_loss, disc_loss = train_step(images, padded_captions)
+        gen_loss_epoch.append(gen_loss.numpy())
+        disc_loss_epoch.append(disc_loss.numpy())
+
         print('.', end='')
+    gen_losses.append(np.mean(gen_loss_epoch))
+    disc_losses.append(np.mean(disc_loss_epoch))
+    plot_losses(gen_losses, disc_losses)
+    if (epoch + 1) % 50 == 0:  # Save the model every 50 epochs
+        generator.save_weights(f'generator_weights_epoch_{epoch + 1}.h5')
+        discriminator.save_weights(f'discriminator_weights_epoch_{epoch + 1}.h5')
     # May Cause Lots of lag (doesnt work on my GPU due to memory limits)
     if bool(gpus) == False: #check if gpu is present
         nvidia_smi.nvmlInit()
         handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0) #only works for 1 card as 0 is hardcoded
         info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle) #finds GPU card info (specifically free memory is what we are looking for)
+        print(info.free)
         if (int(info.free) > (12/1.074e+9)): #determines how much free memory you have and whether you're capable of running this program
             inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
             fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
