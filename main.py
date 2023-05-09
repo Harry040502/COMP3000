@@ -50,11 +50,11 @@ else:
 tf.keras.backend.clear_session() #needed to clear GPU memory from filter_and_copy images using it all up
 sys.stderr = open("error_output.txt", "w")
 datasize = 10000 #May need to reduce this if you have problems with certain inputs and memory problems on GPU
-learning_rate = 1e-4
+learning_rate = 1e-5
 batch_size = 40
 epochs = 100
 AUTOTUNE = tf.data.experimental.AUTOTUNE
-IMG_SIZE = 399
+IMG_SIZE = 299
 image_folder = 'filtered_images'
 def evaluate_generator(generator, inception_model, image_paths, tokenizer, num_samples=1000):
     real_images = []
@@ -166,9 +166,6 @@ def wrapper_function(img_path, cap):
     return img_tensor, cap
 
 
-
-
-
 new_captions_dict = {key: "<end>".join(value.split("<end>")[:3]) for key, value in captions_dict.items()}
 print(new_captions_dict)
 vocab_size = 10000
@@ -188,9 +185,6 @@ def create_dataset(image_paths, captions_dict, batch_size):
     ds = ds.map(wrapper_function, num_parallel_calls=AUTOTUNE)
     ds = ds.batch(batch_size)
     return ds
-
-
-
 
 
 ds = create_dataset(image_paths, captions_dict, batch_size)
@@ -375,7 +369,7 @@ def train_step(images, captions):
 
         gradients_of_generator = gen_tape.gradient(gen_loss, generator.trainable_variables)
         gradients_of_discriminator = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
-        print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")
+        #print(f"Generator loss: {gen_loss}, Discriminator loss: {disc_loss}")
 
         generator_optimizer.apply_gradients(zip(gradients_of_generator, generator.trainable_variables))
         discriminator_optimizer.apply_gradients(zip(gradients_of_discriminator, discriminator.trainable_variables))
@@ -407,15 +401,23 @@ for epoch in range(epochs):
         generator.save_weights(f'generator_weights_epoch_{epoch + 1}.h5')
         discriminator.save_weights(f'discriminator_weights_epoch_{epoch + 1}.h5')
     # May Cause Lots of lag (doesnt work on my GPU due to memory limits)
-    if bool(gpus) == False: #check if gpu is present
-        nvidia_smi.nvmlInit()
-        handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0) #only works for 1 card as 0 is hardcoded
-        info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle) #finds GPU card info (specifically free memory is what we are looking for)
+
+    try:
+        if bool(gpus) == True:  # check if gpu is present
+            nvidia_smi.nvmlInit()
+            handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # only works for 1 card as 0 is hardcoded
+            info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)  # finds GPU card info (specifically free memory is what we are looking for)
+            if (int(info.free) > (
+                    12 / 1.074e+9)):  # determines how much free memory you have and whether you're capable of running this program
+                inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
+                fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
+                print(f"FID score for epoch {epoch + 1}: {fid_score}")
+    except:
+        inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
+        fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
+        print(f"FID score for epoch {epoch + 1}: {fid_score}")
         print(info.free)
-        if (int(info.free) > (12/1.074e+9)): #determines how much free memory you have and whether you're capable of running this program
-            inception_model = InceptionV3(include_top=False, pooling='avg', input_shape=(IMG_SIZE, IMG_SIZE, 3))
-            fid_score = evaluate_generator(generator, inception_model, image_paths, tokenizer)
-            print(f"FID score for epoch {epoch + 1}: {fid_score}")
+
 
 
     print()
